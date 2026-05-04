@@ -4,7 +4,11 @@ import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
 } from "@whiskeysockets/baileys";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import {
+  createClient,
+  type SupabaseClient,
+  type WebSocketLikeConstructor,
+} from "@supabase/supabase-js";
 import cors from "cors";
 import express from "express";
 import type { NextFunction } from "express";
@@ -12,6 +16,11 @@ import { mkdir } from "fs/promises";
 import path from "path";
 import pino from "pino";
 import QRCode from "qrcode";
+import WebSocket from "ws";
+
+process.on("unhandledRejection", (reason: unknown) => {
+  console.error("[WP] unhandledRejection (servidor continua):", reason);
+});
 
 const app = express();
 
@@ -47,6 +56,7 @@ let supabaseAdmin: SupabaseClient | null = null;
 if (supabaseUrl && supabaseServiceKey) {
   supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
     auth: { autoRefreshToken: false, persistSession: false },
+    realtime: { transport: WebSocket as unknown as WebSocketLikeConstructor },
   });
 } else {
   console.warn(
