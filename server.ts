@@ -1,6 +1,8 @@
 import "dotenv/config";
+import dns from "node:dns";
 import { Boom } from "@hapi/boom";
 import makeWASocket, {
+  Browsers,
   BufferJSON,
   DisconnectReason,
   initAuthCreds,
@@ -8,6 +10,9 @@ import makeWASocket, {
   useMultiFileAuthState,
   type AuthenticationState,
 } from "@whiskeysockets/baileys";
+
+/** Evita escolher IPv6 primeiro no Docker/Railway (alguns caminhos até o WA falham no upgrade WS). */
+dns.setDefaultResultOrder("ipv4first");
 import { Mutex } from "async-mutex";
 import type { WebSocketLikeConstructor } from "@supabase/realtime-js";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
@@ -56,6 +61,28 @@ const BAILEYS_MAX_AUTO_RECONNECT = Math.max(
   0,
   Number.parseInt(process.env.BAILEYS_MAX_AUTO_RECONNECT ?? "15", 10) || 15,
 );
+
+/**
+ * Versão do protocolo Web do WhatsApp usada pelo Baileys. Valores antigos costumam gerar
+ * HTTP 405 "Method Not Allowed" no upgrade `wss://web.whatsapp.com/ws/chat`.
+ * Sobrescreva com BAILEYS_WA_VERSION=2,3000,<terciário> (três inteiros) quando o fallback envelhecer.
+ */
+const WA_VERSION_FALLBACK: [number, number, number] = [2, 3000, 1034074495];
+
+function parseWaVersionFromEnv(): [number, number, number] | null {
+  const raw = process.env.BAILEYS_WA_VERSION?.trim();
+  if (!raw) return null;
+  const parts = raw.split(/[.,\s]+/).map((s) => Number.parseInt(s.trim(), 10));
+  if (parts.length === 3 && parts.every((n) => Number.isFinite(n))) {
+    return [parts[0]!, parts[1]!, parts[2]!];
+  }
+  console.warn("[WP] BAILEYS_WA_VERSION deve ter 3 inteiros (ex: 2,3000,1034074495); ignorando.");
+  return null;
+}
+
+function resolveWaVersion(): [number, number, number] {
+  return parseWaVersionFromEnv() ?? WA_VERSION_FALLBACK;
+}
 
 /** Nome lógico da tabela (fisicamente em `public` via `db.schema` no cliente). PostgREST só aceita o nome da tabela em `.from()`, não `public.whatsapp_sessions`. */
 const WHATSAPP_SESSIONS_TABLE = "whatsapp_sessions";
@@ -238,6 +265,7 @@ function disconnectReasonName(code: number | undefined): string {
   if (code === undefined) return "undefined";
   const map: Record<number, string> = {
     [DisconnectReason.connectionClosed]: "connectionClosed",
+    405: "http405_waWebSocketUpgrade_staleVersionOrNetworkBlock",
     408: "connectionLost_or_timedOut",
     [DisconnectReason.connectionReplaced]: "connectionReplaced",
     [DisconnectReason.loggedOut]: "loggedOut",
@@ -493,12 +521,24 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
     `[WP][${tenantId}] Credenciais carregadas: registered=${Boolean((creds as { registered?: boolean }).registered)} me=${(creds as { me?: { id?: string } }).me?.id ?? "n/a"}`,
   );
 
-  console.log(`[WP][${tenantId}] Etapa 5/6: makeWASocket…`);
+  const waVersion = resolveWaVersion();
+  console.log(`[WP][${tenantId}] Etapa 5/6: makeWASocket (WA version ${waVersion.join(".")})…`);
+
   const sock = makeWASocket({
     auth: state,
+    version: waVersion,
+    browser: Browsers.windows("Chrome"),
     logger: baileysLogger,
-    printQRInTerminal: false,
     syncFullHistory: false,
+    countryCode: "BR",
+    markOnlineOnConnect: false,
+    options: {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+      },
+    },
   });
   session.socket = sock;
   console.log(`[WP][${tenantId}] Etapa 6/6: socket criado; registrando listeners (creds.update, connection.update, convites).`);
@@ -551,6 +591,9 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
 
       if (boomError) {
         session.lastError = boomError.message;
+        if (statusCode === 405) {
+          session.lastError = `${boomError.message} (HTTP 405 no WebSocket do WhatsApp: versão WA desatualizada ou bloqueio de rede. Ajuste BAILEYS_WA_VERSION ou o pacote Baileys; em datacenters o WA às vezes bloqueia IPs.)`;
+        }
       }
 
       session.socket = null;

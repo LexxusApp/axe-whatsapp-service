@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch server.ts",
-    "start": "tsx server.ts",
+    "start:dev": "tsx server.ts",
+    "start": "node dist/server.js",
     "build": "tsc",
     "start:prod": "node dist/server.js"
   },
