@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { createHash } from "node:crypto";
 import dns from "node:dns";
 import { Boom } from "@hapi/boom";
 import makeWASocket, {
@@ -62,6 +63,9 @@ const BAILEYS_MAX_AUTO_RECONNECT = Math.max(
   0,
   Number.parseInt(process.env.BAILEYS_MAX_AUTO_RECONNECT ?? "15", 10) || 15,
 );
+
+/** Após 401 no pairing, aguarda antes de novo Baileys para dar tempo de escanear o QR (Railway continua no ar). */
+const WA_QR_GRACE_AFTER_401_MS = 120_000;
 
 /**
  * Versão do protocolo Web do WhatsApp usada pelo Baileys. Valores antigos costumam gerar
@@ -277,6 +281,13 @@ function disconnectReasonName(code: number | undefined): string {
     [DisconnectReason.unavailableService]: "unavailableService",
   };
   return map[code] ?? `unknown_${code}`;
+}
+
+function logQrSnippetForRailway(tenantId: string, qr: string): void {
+  const snippet =
+    qr.length <= 40 ? qr : `${qr.slice(0, 16)}…${qr.slice(-12)} (${qr.length} chars)`;
+  const sha16 = createHash("sha256").update(qr, "utf8").digest("hex").slice(0, 16);
+  console.log(`[WP][${tenantId}] QR snippet="${snippet}" sha256_16=${sha16}`);
 }
 
 function isIntentionalLogoutError(message: string | null | undefined): boolean {
@@ -576,6 +587,7 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
     });
 
     if (qr) {
+      logQrSnippetForRailway(tenantId, qr);
       console.log(`[WP][${tenantId}] QR recebido (${qr.length} chars); gerando data URL…`);
       try {
         session.qrDataUrl = await QRCode.toDataURL(qr, { margin: 2, width: 256 });
@@ -592,9 +604,35 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
       const boomError = lastDisconnect?.error as Boom | undefined;
       const statusCode = boomError?.output?.statusCode;
 
-      if (statusCode === 401 || statusCode === 403) {
+      if (statusCode === 401) {
         console.error(
-          `[WP][${tenantId}] lastDisconnect statusCode=${statusCode} (logout/forbidden) — deletando public.${WHATSAPP_SESSIONS_TABLE} id=${tenantId} e encerrando processo para restart no Railway.`,
+          `[WP][${tenantId}] lastDisconnect statusCode=401 — deletando public.${WHATSAPP_SESSIONS_TABLE} id=${tenantId}. Sem process.exit: próximo Baileys em ${WA_QR_GRACE_AFTER_401_MS / 1000}s para você tentar o QR.`,
+        );
+        if (supabaseAdmin) {
+          const { error } = await supabaseAdmin.from("whatsapp_sessions").delete().eq("id", tenantId);
+          if (error) {
+            console.error(`[WP][${tenantId}] Erro ao deletar whatsapp_sessions: ${error.message}`);
+          }
+        }
+        session.socket = null;
+        session.lastError = boomError?.message ?? "401";
+        if (session.qrRaw) {
+          session.status = "qr";
+        } else {
+          session.status = "closed";
+        }
+        setTimeout(() => {
+          console.log(
+            `[WP][${tenantId}] Fim da espera pós-401 (${WA_QR_GRACE_AFTER_401_MS / 1000}s); iniciando Baileys novamente…`,
+          );
+          void startBaileysForTenant(tenantId, { isAutoReconnect: true });
+        }, WA_QR_GRACE_AFTER_401_MS);
+        return;
+      }
+
+      if (statusCode === 403) {
+        console.error(
+          `[WP][${tenantId}] lastDisconnect statusCode=403 (forbidden) — deletando public.${WHATSAPP_SESSIONS_TABLE} id=${tenantId} e encerrando processo para restart no Railway.`,
         );
         if (supabaseAdmin) {
           const { error } = await supabaseAdmin.from("whatsapp_sessions").delete().eq("id", tenantId);
