@@ -6,6 +6,7 @@ import makeWASocket, {
   BufferJSON,
   DisconnectReason,
   initAuthCreds,
+  makeCacheableSignalKeyStore,
   proto,
   useMultiFileAuthState,
   type AuthenticationState,
@@ -540,11 +541,13 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
   console.log(`[WP][${tenantId}] Etapa 5/6: makeWASocket (WA version ${waVersion.join(".")})…`);
 
   const sock = makeWASocket({
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
+    },
     version: waVersion,
     browser: Browsers.windows("Chrome"),
     logger: baileysLogger,
-    printQRInTerminal: true,
     syncFullHistory: false,
     countryCode: "BR",
     markOnlineOnConnect: false,
@@ -586,12 +589,26 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
     }
 
     if (connection === "close") {
+      const boomError = lastDisconnect?.error as Boom | undefined;
+      const statusCode = boomError?.output?.statusCode;
+
+      if (statusCode === 401 || statusCode === 403) {
+        console.error(
+          `[WP][${tenantId}] lastDisconnect statusCode=${statusCode} (logout/forbidden) — deletando public.${WHATSAPP_SESSIONS_TABLE} id=${tenantId} e encerrando processo para restart no Railway.`,
+        );
+        if (supabaseAdmin) {
+          const { error } = await supabaseAdmin.from("whatsapp_sessions").delete().eq("id", tenantId);
+          if (error) {
+            console.error(`[WP][${tenantId}] Erro ao deletar whatsapp_sessions: ${error.message}`);
+          }
+        }
+        process.exit(1);
+      }
+
       session.status = "closed";
       session.qrRaw = null;
       session.qrDataUrl = null;
 
-      const boomError = lastDisconnect?.error as Boom | undefined;
-      const statusCode = boomError?.output?.statusCode;
       const boomMsg = boomError?.message ?? String(lastDisconnect?.error ?? "");
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
