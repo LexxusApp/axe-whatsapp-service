@@ -278,6 +278,11 @@ function disconnectReasonName(code: number | undefined): string {
   return map[code] ?? `unknown_${code}`;
 }
 
+function isIntentionalLogoutError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  return message.toLowerCase().includes("intentional logout");
+}
+
 function shouldWipeLocalAuthOnDisconnect(statusCode: number | undefined, boomMessage: string): boolean {
   const msg = boomMessage.toLowerCase();
   if (msg.includes("connection failure")) return true;
@@ -472,6 +477,8 @@ type StartBaileysOptions = {
 
 async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOptions): Promise<void> {
   const session = getSession(tenantId);
+  const previousLastError = session.lastError;
+
   if (!opts?.isAutoReconnect) {
     session.allowLocalAuthResetOnFailure = true;
     session.autoReconnectCount = 0;
@@ -490,6 +497,14 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
     console.log(
       `[WP][${tenantId}] startBaileys: reinício automático (${session.autoReconnectCount}/${BAILEYS_MAX_AUTO_RECONNECT || "∞"}).`,
     );
+  }
+
+  if (isIntentionalLogoutError(previousLastError)) {
+    console.log(
+      `[WP][${tenantId}] Último erro foi Intentional Logout — limpando linha em public.${WHATSAPP_SESSIONS_TABLE} (id=${tenantId}) e pasta local antes de carregar auth / conectar.`,
+    );
+    await wipeAuthStorage(tenantId);
+    session.allowLocalAuthResetOnFailure = true;
   }
 
   session.lastError = null;
@@ -529,6 +544,7 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
     version: waVersion,
     browser: Browsers.windows("Chrome"),
     logger: baileysLogger,
+    printQRInTerminal: true,
     syncFullHistory: false,
     countryCode: "BR",
     markOnlineOnConnect: false,
@@ -594,6 +610,14 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
         if (statusCode === 405) {
           session.lastError = `${boomError.message} (HTTP 405 no WebSocket do WhatsApp: versão WA desatualizada ou bloqueio de rede. Ajuste BAILEYS_WA_VERSION ou o pacote Baileys; em datacenters o WA às vezes bloqueia IPs.)`;
         }
+      }
+
+      if (isIntentionalLogoutError(boomMsg)) {
+        console.log(
+          `[WP][${tenantId}] Intentional Logout no disconnect — limpando public.${WHATSAPP_SESSIONS_TABLE} e pasta local.`,
+        );
+        await wipeAuthStorage(tenantId);
+        session.allowLocalAuthResetOnFailure = true;
       }
 
       session.socket = null;
