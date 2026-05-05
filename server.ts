@@ -318,6 +318,26 @@ app.get("/whatsapp/status", (req, res) => {
   }
 });
 
+/** Alias para o frontend (Vercel): mesmo comportamento que POST /api/whatsapp/session */
+app.post("/whatsapp/start", async (req, res) => {
+  try {
+    const tenantId = sanitizeTenantId(String(req.body?.tenant_id ?? ""));
+    await startBaileysForTenant(tenantId);
+    const s = getSession(tenantId);
+    res.status(202).json({
+      tenant_id: tenantId,
+      status: s.status,
+      message:
+        s.status === "qr"
+          ? "Escaneie o QR em GET /api/whatsapp/session/:tenantId/qr"
+          : "Conexão iniciada; consulte o status e o QR nas rotas GET.",
+    });
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "Erro ao iniciar sessão";
+    res.status(400).json({ error: message });
+  }
+});
+
 /**
  * Corpo JSON: { "tenant_id": "<uuid do Supabase>" }
  * Cada zelador usa um tenant_id distinto; a sessão fica em ./sessions/<tenant_id>/.
