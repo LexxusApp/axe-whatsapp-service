@@ -1,14 +1,15 @@
 import "dotenv/config";
 import { Boom } from "@hapi/boom";
 import makeWASocket, {
+  BufferJSON,
   DisconnectReason,
+  initAuthCreds,
+  proto,
   useMultiFileAuthState,
+  type AuthenticationState,
 } from "@whiskeysockets/baileys";
-import {
-  createClient,
-  type SupabaseClient,
-  type WebSocketLikeConstructor,
-} from "@supabase/supabase-js";
+import { Mutex } from "async-mutex";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import cors from "cors";
 import express from "express";
 import type { NextFunction } from "express";
@@ -16,7 +17,6 @@ import { mkdir, rm } from "fs/promises";
 import path from "path";
 import pino from "pino";
 import QRCode from "qrcode";
-import WebSocket from "ws";
 
 process.on("unhandledRejection", (reason: unknown) => {
   console.error("[WP] unhandledRejection (servidor continua):", reason);
@@ -50,13 +50,14 @@ const PORT = Number(process.env.PORT || 8080);
 const SESSIONS_ROOT = path.resolve(process.env.SESSIONS_DIR ?? "./sessions");
 const baileysLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL ?? "silent" });
 
+const WHATSAPP_SESSIONS_TABLE = "whatsapp_sessions";
+
 const supabaseUrl = process.env.SUPABASE_URL?.trim();
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 let supabaseAdmin: SupabaseClient | null = null;
 if (supabaseUrl && supabaseServiceKey) {
   supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
     auth: { autoRefreshToken: false, persistSession: false },
-    realtime: { transport: WebSocket as unknown as WebSocketLikeConstructor },
   });
   console.log(
     "[WP] Supabase: SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY carregadas; cliente inicializado.",
@@ -65,6 +66,118 @@ if (supabaseUrl && supabaseServiceKey) {
   console.warn(
     "[WP] Defina SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY no Railway para confirmações SIM/NÃO em convites de evento.",
   );
+}
+
+function reviveSessionFiles(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object") return {};
+  return JSON.parse(JSON.stringify(raw), BufferJSON.reviver) as Record<string, unknown>;
+}
+
+/**
+ * Mesma semântica de `useMultiFileAuthState`, mas persiste os arquivos virtuais em
+ * `whatsapp_sessions.session_files` via `.select()` / `.upsert()` do @supabase/supabase-js.
+ */
+async function useSupabaseMultiFileAuthState(tenantId: string, client: SupabaseClient) {
+  const mutex = new Mutex();
+  const fixFileName = (file: string) => file?.replace(/\//g, "__")?.replace(/:/g, "-");
+
+  let filesMap: Record<string, unknown> = {};
+
+  const { data: row, error: loadError } = await client
+    .from(WHATSAPP_SESSIONS_TABLE)
+    .select("session_files")
+    .eq("tenant_id", tenantId)
+    .maybeSingle();
+
+  if (loadError) {
+    console.warn(
+      `[WP][${tenantId}] ${WHATSAPP_SESSIONS_TABLE} select: ${loadError.message} (code=${loadError.code ?? "n/a"})`,
+    );
+  } else if (row?.session_files && typeof row.session_files === "object") {
+    filesMap = reviveSessionFiles(row.session_files);
+  }
+
+  const persistLocked = async (): Promise<void> => {
+    const session_files = JSON.parse(JSON.stringify(filesMap, BufferJSON.replacer)) as Record<
+      string,
+      unknown
+    >;
+    const { error } = await client.from(WHATSAPP_SESSIONS_TABLE).upsert(
+      {
+        tenant_id: tenantId,
+        session_files,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "tenant_id" },
+    );
+    if (error) {
+      console.error(
+        `[WP][${tenantId}] ${WHATSAPP_SESSIONS_TABLE} upsert: ${error.message} (code=${error.code ?? "n/a"})`,
+      );
+    }
+  };
+
+  const writeData = async (data: unknown, file: string): Promise<void> => {
+    const key = fixFileName(file);
+    await mutex.runExclusive(async () => {
+      filesMap[key] = JSON.parse(JSON.stringify(data, BufferJSON.replacer));
+      await persistLocked();
+    });
+  };
+
+  const readData = async (file: string) => {
+    const key = fixFileName(file);
+    const v = filesMap[key];
+    if (v === undefined || v === null) return null;
+    return JSON.parse(JSON.stringify(v), BufferJSON.reviver);
+  };
+
+  const removeData = async (file: string): Promise<void> => {
+    const key = fixFileName(file);
+    await mutex.runExclusive(async () => {
+      delete filesMap[key];
+      await persistLocked();
+    });
+  };
+
+  const creds = (await readData("creds.json")) || initAuthCreds();
+
+  const state = {
+    creds,
+    keys: {
+      get: async (type: string, ids: string[]) => {
+        const data: Record<string, unknown> = {};
+        await Promise.all(
+          ids.map(async (id) => {
+            let value = await readData(`${type}-${id}.json`);
+            if (type === "app-state-sync-key" && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value as object);
+            }
+            data[id] = value;
+          }),
+        );
+        return data;
+      },
+      set: async (data: Record<string, Record<string, unknown>>) => {
+        const tasks: Promise<void>[] = [];
+        for (const category of Object.keys(data)) {
+          const bucket = data[category];
+          if (!bucket) continue;
+          for (const id of Object.keys(bucket)) {
+            const value = bucket[id];
+            const file = `${category}-${id}.json`;
+            tasks.push(value ? writeData(value, file) : removeData(file));
+          }
+        }
+        await Promise.all(tasks);
+      },
+    },
+  } as unknown as AuthenticationState;
+
+  return {
+    state,
+    saveCreds: async () => writeData(creds, "creds.json"),
+  };
 }
 
 type SessionStatus = "idle" | "connecting" | "qr" | "open" | "closed";
@@ -135,38 +248,51 @@ function shouldWipeLocalAuthOnDisconnect(statusCode: number | undefined, boomMes
   return false;
 }
 
-async function wipeLocalAuthFolder(tenantId: string): Promise<void> {
+async function wipeAuthStorage(tenantId: string): Promise<void> {
+  if (supabaseAdmin) {
+    const { error } = await supabaseAdmin.from(WHATSAPP_SESSIONS_TABLE).delete().eq("tenant_id", tenantId);
+    if (error) {
+      console.warn(
+        `[WP][${tenantId}] ${WHATSAPP_SESSIONS_TABLE} delete: ${error.message} (code=${error.code ?? "n/a"})`,
+      );
+    } else {
+      console.log(`[WP][${tenantId}] Linha removida em ${WHATSAPP_SESSIONS_TABLE} (sessão zerada no Supabase).`);
+    }
+  }
   const folder = path.join(SESSIONS_ROOT, tenantId);
-  console.log(`[WP][${tenantId}] Removendo credenciais locais (useMultiFileAuthState): ${folder}`);
+  console.log(`[WP][${tenantId}] Removendo pasta local de sessão (se existir): ${folder}`);
   await rm(folder, { recursive: true, force: true });
-  console.log(`[WP][${tenantId}] Credenciais locais removidas; próximo start criará estado novo.`);
+  console.log(`[WP][${tenantId}] Armazenamento de auth limpo; próximo start criará estado novo.`);
 }
 
 async function logSupabaseReachableForTenant(tenantId: string): Promise<void> {
   console.log(
-    `[WP][${tenantId}] Supabase client inicializado=${Boolean(supabaseAdmin)}. Nota: estado Baileys grava em disco (${SESSIONS_ROOT}), não no Supabase.`,
+    `[WP][${tenantId}] Supabase client inicializado=${Boolean(supabaseAdmin)}. Estado Baileys: ${supabaseAdmin ? `tabela ${WHATSAPP_SESSIONS_TABLE}` : `apenas disco (${SESSIONS_ROOT})`}.`,
   );
   if (!supabaseAdmin) {
     console.warn(
-      `[WP][${tenantId}] Sem SUPABASE_URL/SERVICE_ROLE_KEY — handler de convites (convidados_eventos) não roda.`,
+      `[WP][${tenantId}] Sem SUPABASE_URL/SERVICE_ROLE_KEY — sessão só em disco; handler de convites (convidados_eventos) não roda.`,
     );
     return;
   }
   try {
     const { error } = await supabaseAdmin
-      .from("convidados_eventos")
-      .select("id")
+      .from(WHATSAPP_SESSIONS_TABLE)
+      .select("tenant_id")
       .eq("tenant_id", tenantId)
-      .limit(1);
+      .limit(1)
+      .maybeSingle();
     if (error) {
       console.warn(
-        `[WP][${tenantId}] Supabase teste select: ${error.message} (code=${error.code ?? "n/a"})`,
+        `[WP][${tenantId}] Supabase teste ${WHATSAPP_SESSIONS_TABLE}: ${error.message} (code=${error.code ?? "n/a"})`,
       );
     } else {
-      console.log(`[WP][${tenantId}] Supabase: select em convidados_eventos respondeu OK para este tenant.`);
+      console.log(
+        `[WP][${tenantId}] Supabase: select em ${WHATSAPP_SESSIONS_TABLE} respondeu OK (linha opcional; ausência é normal em tenant novo).`,
+      );
     }
   } catch (e: unknown) {
-    console.warn(`[WP][${tenantId}] Supabase teste select: exceção`, e);
+    console.warn(`[WP][${tenantId}] Supabase teste ${WHATSAPP_SESSIONS_TABLE}: exceção`, e);
   }
 }
 
@@ -328,10 +454,14 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
   await destroySocket(session, tenantId, "antes de novo makeWASocket");
 
   const authFolder = path.join(SESSIONS_ROOT, tenantId);
-  console.log(`[WP][${tenantId}] Etapa 3/6: pasta auth=${authFolder} (SESSIONS_ROOT=${SESSIONS_ROOT})`);
+  console.log(`[WP][${tenantId}] Etapa 3/6: pasta auth local=${authFolder} (fallback / limpeza)`);
   await mkdir(authFolder, { recursive: true });
-  console.log(`[WP][${tenantId}] Etapa 4/6: useMultiFileAuthState (carregar/salvar credenciais em disco)…`);
-  const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+  console.log(
+    `[WP][${tenantId}] Etapa 4/6: ${supabaseAdmin ? `auth state Supabase (${WHATSAPP_SESSIONS_TABLE})` : "useMultiFileAuthState em disco"}…`,
+  );
+  const { state, saveCreds } = supabaseAdmin
+    ? await useSupabaseMultiFileAuthState(tenantId, supabaseAdmin)
+    : await useMultiFileAuthState(authFolder);
   const creds = state.creds;
   console.log(
     `[WP][${tenantId}] Credenciais carregadas: registered=${Boolean((creds as { registered?: boolean }).registered)} me=${(creds as { me?: { id?: string } }).me?.id ?? "n/a"}`,
@@ -415,7 +545,7 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
                 `[WP][${tenantId}] Limpando sessão antiga no disco e criando instância nova do zero (uma vez neste ciclo).`,
               );
               sess.allowLocalAuthResetOnFailure = false;
-              await wipeLocalAuthFolder(tenantId);
+              await wipeAuthStorage(tenantId);
             }
             try {
               await startBaileysForTenant(tenantId, { isAutoReconnect: true });
@@ -488,7 +618,8 @@ app.post("/whatsapp/start", async (req, res) => {
 
 /**
  * Corpo JSON: { "tenant_id": "<uuid do Supabase>" }
- * Cada zelador usa um tenant_id distinto; a sessão fica em ./sessions/<tenant_id>/.
+ * Cada zelador usa um tenant_id distinto; com Supabase configurado a sessão Baileys fica em `whatsapp_sessions`;
+ * sem Supabase, uso apenas disco em ./sessions/<tenant_id>/.
  */
 app.post("/api/whatsapp/session", async (req, res) => {
   try {

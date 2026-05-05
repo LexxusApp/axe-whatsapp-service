@@ -13,12 +13,12 @@
     "@hapi/boom": "^10.0.1",
     "@supabase/supabase-js": "^2.49.1",
     "@whiskeysockets/baileys": "^6.7.21",
+    "async-mutex": "^0.5.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
     "pino": "^9.5.0",
-    "qrcode": "^1.5.4",
-    "ws": "^8.20.0"
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
