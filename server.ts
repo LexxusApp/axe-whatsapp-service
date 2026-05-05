@@ -56,16 +56,11 @@ app.use(
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 8080);
+const CONNECT_ROUTE_HINT =
+  'O Baileys só inicia com POST /connect (corpo JSON: { "tenant_id": "<uuid>" } ou header x-tenant-id).';
+
 const SESSIONS_ROOT = path.resolve(process.env.SESSIONS_DIR ?? "./sessions");
 const baileysLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL ?? "silent" });
-/** Máximo de `startBaileysForTenant` automáticos seguidos sem `connection === "open"` (evita loop no Railway). */
-const BAILEYS_MAX_AUTO_RECONNECT = Math.max(
-  0,
-  Number.parseInt(process.env.BAILEYS_MAX_AUTO_RECONNECT ?? "15", 10) || 15,
-);
-
-/** Após 401 no pairing, aguarda antes de novo Baileys para dar tempo de escanear o QR (Railway continua no ar). */
-const WA_QR_GRACE_AFTER_401_MS = 120_000;
 
 /**
  * Versão do protocolo Web do WhatsApp usada pelo Baileys. Valores antigos costumam gerar
@@ -230,10 +225,8 @@ type TenantSession = {
   qrDataUrl: string | null;
   status: SessionStatus;
   lastError: string | null;
-  /** Se true (padrão), na próxima falha recuperável pode apagar credenciais em disco uma vez até novo POST /start. */
+  /** Se true (padrão), na próxima falha recuperável pode apagar credenciais em disco uma vez até novo POST /connect. */
   allowLocalAuthResetOnFailure?: boolean;
-  /** Tentativas de reinício automático desde a última vez que a conexão ficou `open` (cap em BAILEYS_MAX_AUTO_RECONNECT). */
-  autoReconnectCount?: number;
 };
 
 const tenantSessions = new Map<string, TenantSession>();
@@ -259,7 +252,6 @@ function getSession(tenantId: string): TenantSession {
       status: "idle",
       lastError: null,
       allowLocalAuthResetOnFailure: true,
-      autoReconnectCount: 0,
     } satisfies TenantSession;
     tenantSessions.set(tenantId, s);
   }
@@ -295,15 +287,11 @@ function isIntentionalLogoutError(message: string | null | undefined): boolean {
   return message.toLowerCase().includes("intentional logout");
 }
 
-function shouldWipeLocalAuthOnDisconnect(statusCode: number | undefined, boomMessage: string): boolean {
-  const msg = boomMessage.toLowerCase();
-  if (msg.includes("connection failure")) return true;
-  if (msg.includes("connect") && msg.includes("fail")) return true;
-  if (statusCode === DisconnectReason.restartRequired) return true;
-  if (statusCode === DisconnectReason.badSession) return true;
-  if (statusCode === DisconnectReason.multideviceMismatch) return true;
-  if (statusCode === DisconnectReason.forbidden) return true;
-  return false;
+function isLogoutOr401Disconnect(statusCode: number | undefined, boomMsg: string): boolean {
+  if (statusCode === 401) return true;
+  if (isIntentionalLogoutError(boomMsg)) return true;
+  const m = boomMsg.toLowerCase();
+  return m.includes("logged out") || m.includes("logout");
 }
 
 async function wipeAuthStorage(tenantId: string): Promise<void> {
@@ -482,34 +470,12 @@ async function destroySocket(session: TenantSession, tenantId: string, reason: s
   }
 }
 
-type StartBaileysOptions = {
-  /** true quando o reinício vem do handler connection.update (não redefine allowLocalAuthResetOnFailure). */
-  isAutoReconnect?: boolean;
-};
-
-async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOptions): Promise<void> {
+async function startBaileysForTenant(tenantId: string): Promise<void> {
   const session = getSession(tenantId);
   const previousLastError = session.lastError;
 
-  if (!opts?.isAutoReconnect) {
-    session.allowLocalAuthResetOnFailure = true;
-    session.autoReconnectCount = 0;
-    console.log(`[WP][${tenantId}] startBaileys: pedido novo (API ou primeiro start). allowLocalAuthResetOnFailure=true`);
-  } else {
-    const nextAttempt = (session.autoReconnectCount ?? 0) + 1;
-    if (BAILEYS_MAX_AUTO_RECONNECT > 0 && nextAttempt > BAILEYS_MAX_AUTO_RECONNECT) {
-      const msg = `Limite de auto-reconexão (${BAILEYS_MAX_AUTO_RECONNECT} tentativas) atingido; parando para evitar loop. Use POST /api/whatsapp/session para tentar de novo.`;
-      console.error(`[WP][${tenantId}] ${msg}`);
-      session.status = "closed";
-      session.lastError = msg;
-      session.socket = null;
-      return;
-    }
-    session.autoReconnectCount = nextAttempt;
-    console.log(
-      `[WP][${tenantId}] startBaileys: reinício automático (${session.autoReconnectCount}/${BAILEYS_MAX_AUTO_RECONNECT || "∞"}).`,
-    );
-  }
+  session.allowLocalAuthResetOnFailure = true;
+  console.log(`[WP][${tenantId}] startBaileys: acionado por POST /connect.`);
 
   if (isIntentionalLogoutError(previousLastError)) {
     console.log(
@@ -524,12 +490,8 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
   session.qrRaw = null;
   session.qrDataUrl = null;
 
-  if (!opts?.isAutoReconnect) {
-    console.log(`[WP][${tenantId}] Etapa 1/6: verificando Supabase (acessível para este tenant)…`);
-    await logSupabaseReachableForTenant(tenantId);
-  } else {
-    console.log(`[WP][${tenantId}] Etapa 1/6: auto-reconnect — pulando reteste Supabase (cliente já validado neste processo).`);
-  }
+  console.log(`[WP][${tenantId}] Etapa 1/6: verificando Supabase (acessível para este tenant)…`);
+  await logSupabaseReachableForTenant(tenantId);
 
   console.log(`[WP][${tenantId}] Etapa 2/6: destruindo socket anterior se existir…`);
   await destroySocket(session, tenantId, "antes de novo makeWASocket");
@@ -603,59 +565,42 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
     if (connection === "close") {
       const boomError = lastDisconnect?.error as Boom | undefined;
       const statusCode = boomError?.output?.statusCode;
-
-      if (statusCode === 401) {
-        console.error(
-          `[WP][${tenantId}] lastDisconnect statusCode=401 — deletando public.${WHATSAPP_SESSIONS_TABLE} id=${tenantId}. Sem process.exit: próximo Baileys em ${WA_QR_GRACE_AFTER_401_MS / 1000}s para você tentar o QR.`,
-        );
-        if (supabaseAdmin) {
-          const { error } = await supabaseAdmin.from("whatsapp_sessions").delete().eq("id", tenantId);
-          if (error) {
-            console.error(`[WP][${tenantId}] Erro ao deletar whatsapp_sessions: ${error.message}`);
-          }
-        }
-        session.socket = null;
-        session.lastError = boomError?.message ?? "401";
-        if (session.qrRaw) {
-          session.status = "qr";
-        } else {
-          session.status = "closed";
-        }
-        setTimeout(() => {
-          console.log(
-            `[WP][${tenantId}] Fim da espera pós-401 (${WA_QR_GRACE_AFTER_401_MS / 1000}s); iniciando Baileys novamente…`,
-          );
-          void startBaileysForTenant(tenantId, { isAutoReconnect: true });
-        }, WA_QR_GRACE_AFTER_401_MS);
-        return;
-      }
+      const boomMsg = boomError?.message ?? String(lastDisconnect?.error ?? "");
 
       if (statusCode === 403) {
         console.error(
-          `[WP][${tenantId}] lastDisconnect statusCode=403 (forbidden) — deletando public.${WHATSAPP_SESSIONS_TABLE} id=${tenantId} e encerrando processo para restart no Railway.`,
+          `[WP][${tenantId}] lastDisconnect statusCode=403 (forbidden) — limpando sessão e encerrando processo (código 1).`,
         );
-        if (supabaseAdmin) {
-          const { error } = await supabaseAdmin.from("whatsapp_sessions").delete().eq("id", tenantId);
-          if (error) {
-            console.error(`[WP][${tenantId}] Erro ao deletar whatsapp_sessions: ${error.message}`);
-          }
-        }
+        await wipeAuthStorage(tenantId);
+        session.socket = null;
+        session.status = "closed";
+        session.qrRaw = null;
+        session.qrDataUrl = null;
         process.exit(1);
+      }
+
+      if (isLogoutOr401Disconnect(statusCode, boomMsg)) {
+        console.error(
+          `[WP][${tenantId}] Logout ou 401 — limpando public.${WHATSAPP_SESSIONS_TABLE} e disco; encerrando processo (código 0). Após reinício do Railway, use POST /connect para novo QR.`,
+        );
+        await wipeAuthStorage(tenantId);
+        session.socket = null;
+        session.status = "closed";
+        session.qrRaw = null;
+        session.qrDataUrl = null;
+        session.lastError = boomMsg;
+        process.exit(0);
       }
 
       session.status = "closed";
       session.qrRaw = null;
       session.qrDataUrl = null;
-
-      const boomMsg = boomError?.message ?? String(lastDisconnect?.error ?? "");
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      session.socket = null;
 
       console.log(`[WP][${tenantId}] Conexão FECHADA:`, {
         boomMessage: boomMsg,
         statusCode,
         disconnectReason: disconnectReasonName(statusCode),
-        shouldReconnect,
-        loggedOut: statusCode === DisconnectReason.loggedOut,
         lastDisconnectDate: lastDisconnect?.date?.toISOString?.() ?? lastDisconnect?.date,
         output: boomError?.output,
       });
@@ -667,54 +612,14 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
         }
       }
 
-      if (isIntentionalLogoutError(boomMsg)) {
-        console.log(
-          `[WP][${tenantId}] Intentional Logout no disconnect — limpando public.${WHATSAPP_SESSIONS_TABLE} e pasta local.`,
-        );
-        await wipeAuthStorage(tenantId);
-        session.allowLocalAuthResetOnFailure = true;
-      }
-
-      session.socket = null;
-
-      const wipeRecommended = shouldWipeLocalAuthOnDisconnect(statusCode, boomMsg);
-      const mayWipe = wipeRecommended && (session.allowLocalAuthResetOnFailure !== false);
-      console.log(`[WP][${tenantId}] Política pós-falha: wipeRecommended=${wipeRecommended} mayWipe=${mayWipe} allowFlag=${session.allowLocalAuthResetOnFailure}`);
-
-      if (shouldReconnect) {
-        const delayMs = 2500;
-        console.log(`[WP][${tenantId}] Agendando reinício em ${delayMs}ms…`);
-        setTimeout(() => {
-          void (async () => {
-            const sess = getSession(tenantId);
-            const doWipe = shouldWipeLocalAuthOnDisconnect(statusCode, boomMsg) && sess.allowLocalAuthResetOnFailure !== false;
-            if (doWipe) {
-              console.log(
-                `[WP][${tenantId}] Limpando sessão antiga no disco e criando instância nova do zero (uma vez neste ciclo).`,
-              );
-              sess.allowLocalAuthResetOnFailure = false;
-              await wipeAuthStorage(tenantId);
-            }
-            try {
-              await startBaileysForTenant(tenantId, { isAutoReconnect: true });
-              console.log(`[WP][${tenantId}] Reinício automático concluiu startBaileysForTenant.`);
-            } catch (e: unknown) {
-              const msg = e instanceof Error ? e.message : String(e);
-              console.error(`[WP][${tenantId}] Reinício automático falhou:`, msg);
-              getSession(tenantId).lastError = msg;
-              getSession(tenantId).status = "closed";
-            }
-          })();
-        }, delayMs);
-      } else {
-        console.log(`[WP][${tenantId}] Não reconectar (logged out ou equivalente).`);
-      }
+      console.log(
+        `[WP][${tenantId}] Sem auto-reconexão. Para gerar novo QR ou reconectar, envie POST /connect com este tenant_id.`,
+      );
     } else if (connection === "open") {
       session.status = "open";
       session.qrRaw = null;
       session.qrDataUrl = null;
       session.lastError = null;
-      session.autoReconnectCount = 0;
       console.log(`[WP][${tenantId}] Conexão ABERTA (WhatsApp pronto).`);
     } else if (connection === "connecting") {
       console.log(`[WP][${tenantId}] Conexão em estado connecting…`);
@@ -724,6 +629,32 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "axe-whatsapp-baileys" });
+});
+
+/** Única rota que inicia o Baileys e pode disparar geração de QR. */
+app.post("/connect", async (req, res) => {
+  try {
+    const tenantId = sanitizeTenantId(
+      String(
+        (req.body as { tenant_id?: string })?.tenant_id ??
+          req.headers["x-tenant-id"] ??
+          "",
+      ),
+    );
+    await startBaileysForTenant(tenantId);
+    const s = getSession(tenantId);
+    res.status(202).json({
+      tenant_id: tenantId,
+      status: s.status,
+      message:
+        s.status === "qr"
+          ? "QR disponível em GET /api/whatsapp/session/:tenantId/qr"
+          : "Conexão iniciada; use GET /api/whatsapp/session/:tenantId/status para acompanhar.",
+    });
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "Erro ao conectar";
+    res.status(400).json({ error: message });
+  }
 });
 
 /** Alias para o frontend (Vercel): mesmo payload que GET /api/whatsapp/session/:tenantId/status */
@@ -745,63 +676,22 @@ app.get("/whatsapp/status", (req, res) => {
   }
 });
 
-/** Alias para o frontend (Vercel): mesmo comportamento que POST /api/whatsapp/session */
-app.post("/whatsapp/start", async (req, res) => {
-  try {
-    const tenantId = sanitizeTenantId(String(req.body?.tenant_id ?? ""));
-    await startBaileysForTenant(tenantId);
-    const s = getSession(tenantId);
-    res.status(202).json({
-      tenant_id: tenantId,
-      status: s.status,
-      message:
-        s.status === "qr"
-          ? "Escaneie o QR em GET /api/whatsapp/session/:tenantId/qr"
-          : "Conexão iniciada; consulte o status e o QR nas rotas GET.",
-    });
-  } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "Erro ao iniciar sessão";
-    res.status(400).json({ error: message });
-  }
+/** @deprecated Use POST /connect */
+app.post("/whatsapp/start", (_req, res) => {
+  res.status(400).json({ error: CONNECT_ROUTE_HINT });
 });
 
 /**
- * Corpo JSON: { "tenant_id": "<uuid do Supabase>" }
- * Cada zelador usa um tenant_id distinto; com Supabase configurado a sessão Baileys fica em `public.whatsapp_sessions` (colunas id, data);
- * sem Supabase, uso apenas disco em ./sessions/<tenant_id>/.
+ * @deprecated Use POST /connect
+ * Sessão em `public.whatsapp_sessions` (id, data) quando Supabase está configurado.
  */
-app.post("/api/whatsapp/session", async (req, res) => {
-  try {
-    const tenantId = sanitizeTenantId(String(req.body?.tenant_id ?? ""));
-    await startBaileysForTenant(tenantId);
-    const s = getSession(tenantId);
-    res.status(202).json({
-      tenant_id: tenantId,
-      status: s.status,
-      message:
-        s.status === "qr"
-          ? "Escaneie o QR em GET /api/whatsapp/session/:tenantId/qr"
-          : "Conexão iniciada; consulte o status e o QR nas rotas GET.",
-    });
-  } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "Erro ao iniciar sessão";
-    res.status(400).json({ error: message });
-  }
+app.post("/api/whatsapp/session", (_req, res) => {
+  res.status(400).json({ error: CONNECT_ROUTE_HINT });
 });
 
-app.post("/api/whatsapp/session/:tenantId/start", async (req, res) => {
-  try {
-    const tenantId = sanitizeTenantId(req.params.tenantId);
-    await startBaileysForTenant(tenantId);
-    const s = getSession(tenantId);
-    res.status(202).json({
-      tenant_id: tenantId,
-      status: s.status,
-    });
-  } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "Erro ao iniciar sessão";
-    res.status(400).json({ error: message });
-  }
+/** @deprecated Use POST /connect */
+app.post("/api/whatsapp/session/:tenantId/start", (_req, res) => {
+  res.status(400).json({ error: CONNECT_ROUTE_HINT });
 });
 
 app.get("/api/whatsapp/session/:tenantId/qr", (req, res) => {
@@ -811,7 +701,7 @@ app.get("/api/whatsapp/session/:tenantId/qr", (req, res) => {
     if (!s.qrRaw && s.status !== "open") {
       return res.status(404).json({
         tenant_id: tenantId,
-        error: "Nenhum QR disponível ainda. Chame POST .../session com este tenant_id.",
+        error: "Nenhum QR disponível ainda. Chame POST /connect com este tenant_id.",
         status: s.status,
       });
     }
@@ -900,6 +790,7 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
+  console.log("[WP] Aguardando comando para gerar QR...");
   console.log(
     `Axé WhatsApp (Baileys) ouvindo na porta ${PORT} (Number(process.env.PORT || 8080))`,
   );
