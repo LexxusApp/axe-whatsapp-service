@@ -12,7 +12,7 @@ import {
 import cors from "cors";
 import express from "express";
 import type { NextFunction } from "express";
-import { mkdir } from "fs/promises";
+import { mkdir, rm } from "fs/promises";
 import path from "path";
 import pino from "pino";
 import QRCode from "qrcode";
@@ -75,6 +75,8 @@ type TenantSession = {
   qrDataUrl: string | null;
   status: SessionStatus;
   lastError: string | null;
+  /** Se true (padrão), na próxima falha recuperável pode apagar credenciais em disco uma vez até novo POST /start. */
+  allowLocalAuthResetOnFailure?: boolean;
 };
 
 const tenantSessions = new Map<string, TenantSession>();
@@ -99,10 +101,73 @@ function getSession(tenantId: string): TenantSession {
       qrDataUrl: null,
       status: "idle",
       lastError: null,
-    };
+      allowLocalAuthResetOnFailure: true,
+    } satisfies TenantSession;
     tenantSessions.set(tenantId, s);
   }
   return s;
+}
+
+function disconnectReasonName(code: number | undefined): string {
+  if (code === undefined) return "undefined";
+  const map: Record<number, string> = {
+    [DisconnectReason.connectionClosed]: "connectionClosed",
+    408: "connectionLost_or_timedOut",
+    [DisconnectReason.connectionReplaced]: "connectionReplaced",
+    [DisconnectReason.loggedOut]: "loggedOut",
+    [DisconnectReason.badSession]: "badSession",
+    [DisconnectReason.restartRequired]: "restartRequired",
+    [DisconnectReason.multideviceMismatch]: "multideviceMismatch",
+    [DisconnectReason.forbidden]: "forbidden",
+    [DisconnectReason.unavailableService]: "unavailableService",
+  };
+  return map[code] ?? `unknown_${code}`;
+}
+
+function shouldWipeLocalAuthOnDisconnect(statusCode: number | undefined, boomMessage: string): boolean {
+  const msg = boomMessage.toLowerCase();
+  if (msg.includes("connection failure")) return true;
+  if (msg.includes("connect") && msg.includes("fail")) return true;
+  if (statusCode === DisconnectReason.restartRequired) return true;
+  if (statusCode === DisconnectReason.badSession) return true;
+  if (statusCode === DisconnectReason.multideviceMismatch) return true;
+  if (statusCode === DisconnectReason.forbidden) return true;
+  return false;
+}
+
+async function wipeLocalAuthFolder(tenantId: string): Promise<void> {
+  const folder = path.join(SESSIONS_ROOT, tenantId);
+  console.log(`[WP][${tenantId}] Removendo credenciais locais (useMultiFileAuthState): ${folder}`);
+  await rm(folder, { recursive: true, force: true });
+  console.log(`[WP][${tenantId}] Credenciais locais removidas; próximo start criará estado novo.`);
+}
+
+async function logSupabaseReachableForTenant(tenantId: string): Promise<void> {
+  console.log(
+    `[WP][${tenantId}] Supabase client inicializado=${Boolean(supabaseAdmin)}. Nota: estado Baileys grava em disco (${SESSIONS_ROOT}), não no Supabase.`,
+  );
+  if (!supabaseAdmin) {
+    console.warn(
+      `[WP][${tenantId}] Sem SUPABASE_URL/SERVICE_ROLE_KEY — handler de convites (convidados_eventos) não roda.`,
+    );
+    return;
+  }
+  try {
+    const { error } = await supabaseAdmin
+      .from("convidados_eventos")
+      .select("id")
+      .eq("tenant_id", tenantId)
+      .limit(1);
+    if (error) {
+      console.warn(
+        `[WP][${tenantId}] Supabase teste select: ${error.message} (code=${error.code ?? "n/a"})`,
+      );
+    } else {
+      console.log(`[WP][${tenantId}] Supabase: select em convidados_eventos respondeu OK para este tenant.`);
+    }
+  } catch (e: unknown) {
+    console.warn(`[WP][${tenantId}] Supabase teste select: exceção`, e);
+  }
 }
 
 async function sendWhatsAppTextForTenant(
@@ -211,58 +276,101 @@ function requireWhatsappProxySecret(req: express.Request, res: express.Response,
   next();
 }
 
-async function destroySocket(session: TenantSession): Promise<void> {
+async function destroySocket(session: TenantSession, tenantId: string, reason: string): Promise<void> {
   const sock = session.socket;
   session.socket = null;
-  if (!sock) return;
+  if (!sock) {
+    console.log(`[WP][${tenantId}] destroySocket (${reason}): nenhum socket ativo.`);
+    return;
+  }
+  console.log(`[WP][${tenantId}] destroySocket (${reason}): encerrando socket…`);
   try {
     await sock.logout();
-  } catch {
+    console.log(`[WP][${tenantId}] destroySocket: logout() concluído.`);
+  } catch (e: unknown) {
+    console.log(`[WP][${tenantId}] destroySocket: logout falhou (${e instanceof Error ? e.message : String(e)}), tentando end()…`);
     try {
       sock.end(undefined);
-    } catch {
-      /* ignore */
+      console.log(`[WP][${tenantId}] destroySocket: end() chamado.`);
+    } catch (e2: unknown) {
+      console.log(`[WP][${tenantId}] destroySocket: end() também falhou —`, e2);
     }
   }
 }
 
-async function startBaileysForTenant(tenantId: string): Promise<void> {
+type StartBaileysOptions = {
+  /** true quando o reinício vem do handler connection.update (não redefine allowLocalAuthResetOnFailure). */
+  isAutoReconnect?: boolean;
+};
+
+async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOptions): Promise<void> {
   const session = getSession(tenantId);
+  if (!opts?.isAutoReconnect) {
+    session.allowLocalAuthResetOnFailure = true;
+    console.log(`[WP][${tenantId}] startBaileys: pedido novo (API ou primeiro start). allowLocalAuthResetOnFailure=true`);
+  } else {
+    console.log(`[WP][${tenantId}] startBaileys: reinício automático (isAutoReconnect=true).`);
+  }
+
   session.lastError = null;
   session.status = "connecting";
   session.qrRaw = null;
   session.qrDataUrl = null;
 
-  await destroySocket(session);
+  if (!opts?.isAutoReconnect) {
+    console.log(`[WP][${tenantId}] Etapa 1/6: verificando Supabase (acessível para este tenant)…`);
+    await logSupabaseReachableForTenant(tenantId);
+  } else {
+    console.log(`[WP][${tenantId}] Etapa 1/6: auto-reconnect — pulando reteste Supabase (cliente já validado neste processo).`);
+  }
+
+  console.log(`[WP][${tenantId}] Etapa 2/6: destruindo socket anterior se existir…`);
+  await destroySocket(session, tenantId, "antes de novo makeWASocket");
 
   const authFolder = path.join(SESSIONS_ROOT, tenantId);
+  console.log(`[WP][${tenantId}] Etapa 3/6: pasta auth=${authFolder} (SESSIONS_ROOT=${SESSIONS_ROOT})`);
   await mkdir(authFolder, { recursive: true });
-
+  console.log(`[WP][${tenantId}] Etapa 4/6: useMultiFileAuthState (carregar/salvar credenciais em disco)…`);
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+  const creds = state.creds;
+  console.log(
+    `[WP][${tenantId}] Credenciais carregadas: registered=${Boolean((creds as { registered?: boolean }).registered)} me=${(creds as { me?: { id?: string } }).me?.id ?? "n/a"}`,
+  );
 
+  console.log(`[WP][${tenantId}] Etapa 5/6: makeWASocket…`);
   const sock = makeWASocket({
     auth: state,
     logger: baileysLogger,
     printQRInTerminal: false,
     syncFullHistory: false,
   });
-
   session.socket = sock;
+  console.log(`[WP][${tenantId}] Etapa 6/6: socket criado; registrando listeners (creds.update, connection.update, convites).`);
 
   sock.ev.on("creds.update", saveCreds);
   attachConviteInboundHandler(tenantId, sock);
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
+    console.log(`[WP][${tenantId}] connection.update:`, {
+      connection: connection ?? "undefined",
+      hasQr: Boolean(qr),
+      isNewLogin: update.isNewLogin,
+      isOnline: update.isOnline,
+      receivedPendingNotifications: update.receivedPendingNotifications,
+    });
 
     if (qr) {
+      console.log(`[WP][${tenantId}] QR recebido (${qr.length} chars); gerando data URL…`);
       try {
         session.qrDataUrl = await QRCode.toDataURL(qr, { margin: 2, width: 256 });
-      } catch {
+      } catch (e: unknown) {
+        console.warn(`[WP][${tenantId}] Falha ao gerar QRCode data URL:`, e);
         session.qrDataUrl = null;
       }
       session.qrRaw = qr;
       session.status = "qr";
+      console.log(`[WP][${tenantId}] Status => qr`);
     }
 
     if (connection === "close") {
@@ -272,7 +380,18 @@ async function startBaileysForTenant(tenantId: string): Promise<void> {
 
       const boomError = lastDisconnect?.error as Boom | undefined;
       const statusCode = boomError?.output?.statusCode;
+      const boomMsg = boomError?.message ?? String(lastDisconnect?.error ?? "");
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      console.log(`[WP][${tenantId}] Conexão FECHADA:`, {
+        boomMessage: boomMsg,
+        statusCode,
+        disconnectReason: disconnectReasonName(statusCode),
+        shouldReconnect,
+        loggedOut: statusCode === DisconnectReason.loggedOut,
+        lastDisconnectDate: lastDisconnect?.date?.toISOString?.() ?? lastDisconnect?.date,
+        output: boomError?.output,
+      });
 
       if (boomError) {
         session.lastError = boomError.message;
@@ -280,20 +399,46 @@ async function startBaileysForTenant(tenantId: string): Promise<void> {
 
       session.socket = null;
 
+      const wipeRecommended = shouldWipeLocalAuthOnDisconnect(statusCode, boomMsg);
+      const mayWipe = wipeRecommended && (session.allowLocalAuthResetOnFailure !== false);
+      console.log(`[WP][${tenantId}] Política pós-falha: wipeRecommended=${wipeRecommended} mayWipe=${mayWipe} allowFlag=${session.allowLocalAuthResetOnFailure}`);
+
       if (shouldReconnect) {
+        const delayMs = 2500;
+        console.log(`[WP][${tenantId}] Agendando reinício em ${delayMs}ms…`);
         setTimeout(() => {
-          void startBaileysForTenant(tenantId).catch((e: unknown) => {
-            const msg = e instanceof Error ? e.message : String(e);
-            getSession(tenantId).lastError = msg;
-            getSession(tenantId).status = "closed";
-          });
-        }, 2500);
+          void (async () => {
+            const sess = getSession(tenantId);
+            const doWipe = shouldWipeLocalAuthOnDisconnect(statusCode, boomMsg) && sess.allowLocalAuthResetOnFailure !== false;
+            if (doWipe) {
+              console.log(
+                `[WP][${tenantId}] Limpando sessão antiga no disco e criando instância nova do zero (uma vez neste ciclo).`,
+              );
+              sess.allowLocalAuthResetOnFailure = false;
+              await wipeLocalAuthFolder(tenantId);
+            }
+            try {
+              await startBaileysForTenant(tenantId, { isAutoReconnect: true });
+              console.log(`[WP][${tenantId}] Reinício automático concluiu startBaileysForTenant.`);
+            } catch (e: unknown) {
+              const msg = e instanceof Error ? e.message : String(e);
+              console.error(`[WP][${tenantId}] Reinício automático falhou:`, msg);
+              getSession(tenantId).lastError = msg;
+              getSession(tenantId).status = "closed";
+            }
+          })();
+        }, delayMs);
+      } else {
+        console.log(`[WP][${tenantId}] Não reconectar (logged out ou equivalente).`);
       }
     } else if (connection === "open") {
       session.status = "open";
       session.qrRaw = null;
       session.qrDataUrl = null;
       session.lastError = null;
+      console.log(`[WP][${tenantId}] Conexão ABERTA (WhatsApp pronto).`);
+    } else if (connection === "connecting") {
+      console.log(`[WP][${tenantId}] Conexão em estado connecting…`);
     }
   });
 }
@@ -428,7 +573,7 @@ app.post("/api/whatsapp/session/:tenantId/logout", async (req, res) => {
   try {
     const tenantId = sanitizeTenantId(req.params.tenantId);
     const s = getSession(tenantId);
-    await destroySocket(s);
+    await destroySocket(s, tenantId, "POST logout");
     s.status = "idle";
     s.qrRaw = null;
     s.qrDataUrl = null;
