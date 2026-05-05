@@ -46,7 +46,7 @@ app.use(
 );
 app.use(express.json());
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT || 8080);
 const SESSIONS_ROOT = path.resolve(process.env.SESSIONS_DIR ?? "./sessions");
 const baileysLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL ?? "silent" });
 
@@ -58,6 +58,9 @@ if (supabaseUrl && supabaseServiceKey) {
     auth: { autoRefreshToken: false, persistSession: false },
     realtime: { transport: WebSocket as unknown as WebSocketLikeConstructor },
   });
+  console.log(
+    "[WP] Supabase: SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY carregadas; cliente inicializado.",
+  );
 } else {
   console.warn(
     "[WP] Defina SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY no Railway para confirmações SIM/NÃO em convites de evento.",
@@ -472,6 +475,8 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Axé WhatsApp (Baileys) ouvindo na porta ${PORT} (process.env.PORT)`);
+  console.log(
+    `Axé WhatsApp (Baileys) ouvindo na porta ${PORT} (Number(process.env.PORT || 8080))`,
+  );
   console.log(`Pasta de sessões: ${SESSIONS_ROOT}`);
 });
