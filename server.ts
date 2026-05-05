@@ -9,7 +9,9 @@ import makeWASocket, {
   type AuthenticationState,
 } from "@whiskeysockets/baileys";
 import { Mutex } from "async-mutex";
+import type { WebSocketLikeConstructor } from "@supabase/realtime-js";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import ws from "ws";
 import cors from "cors";
 import express from "express";
 import type { NextFunction } from "express";
@@ -49,6 +51,11 @@ app.use(express.json());
 const PORT = Number(process.env.PORT || 8080);
 const SESSIONS_ROOT = path.resolve(process.env.SESSIONS_DIR ?? "./sessions");
 const baileysLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL ?? "silent" });
+/** Máximo de `startBaileysForTenant` automáticos seguidos sem `connection === "open"` (evita loop no Railway). */
+const BAILEYS_MAX_AUTO_RECONNECT = Math.max(
+  0,
+  Number.parseInt(process.env.BAILEYS_MAX_AUTO_RECONNECT ?? "15", 10) || 15,
+);
 
 const WHATSAPP_SESSIONS_TABLE = "whatsapp_sessions";
 
@@ -58,6 +65,9 @@ let supabaseAdmin: SupabaseClient | null = null;
 if (supabaseUrl && supabaseServiceKey) {
   supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
     auth: { autoRefreshToken: false, persistSession: false },
+    realtime: {
+      transport: ws as unknown as WebSocketLikeConstructor,
+    },
   });
   console.log(
     "[WP] Supabase: SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY carregadas; cliente inicializado.",
@@ -190,6 +200,8 @@ type TenantSession = {
   lastError: string | null;
   /** Se true (padrão), na próxima falha recuperável pode apagar credenciais em disco uma vez até novo POST /start. */
   allowLocalAuthResetOnFailure?: boolean;
+  /** Tentativas de reinício automático desde a última vez que a conexão ficou `open` (cap em BAILEYS_MAX_AUTO_RECONNECT). */
+  autoReconnectCount?: number;
 };
 
 const tenantSessions = new Map<string, TenantSession>();
@@ -215,6 +227,7 @@ function getSession(tenantId: string): TenantSession {
       status: "idle",
       lastError: null,
       allowLocalAuthResetOnFailure: true,
+      autoReconnectCount: 0,
     } satisfies TenantSession;
     tenantSessions.set(tenantId, s);
   }
@@ -433,9 +446,22 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
   const session = getSession(tenantId);
   if (!opts?.isAutoReconnect) {
     session.allowLocalAuthResetOnFailure = true;
+    session.autoReconnectCount = 0;
     console.log(`[WP][${tenantId}] startBaileys: pedido novo (API ou primeiro start). allowLocalAuthResetOnFailure=true`);
   } else {
-    console.log(`[WP][${tenantId}] startBaileys: reinício automático (isAutoReconnect=true).`);
+    const nextAttempt = (session.autoReconnectCount ?? 0) + 1;
+    if (BAILEYS_MAX_AUTO_RECONNECT > 0 && nextAttempt > BAILEYS_MAX_AUTO_RECONNECT) {
+      const msg = `Limite de auto-reconexão (${BAILEYS_MAX_AUTO_RECONNECT} tentativas) atingido; parando para evitar loop. Use POST /api/whatsapp/session para tentar de novo.`;
+      console.error(`[WP][${tenantId}] ${msg}`);
+      session.status = "closed";
+      session.lastError = msg;
+      session.socket = null;
+      return;
+    }
+    session.autoReconnectCount = nextAttempt;
+    console.log(
+      `[WP][${tenantId}] startBaileys: reinício automático (${session.autoReconnectCount}/${BAILEYS_MAX_AUTO_RECONNECT || "∞"}).`,
+    );
   }
 
   session.lastError = null;
@@ -566,6 +592,7 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
       session.qrRaw = null;
       session.qrDataUrl = null;
       session.lastError = null;
+      session.autoReconnectCount = 0;
       console.log(`[WP][${tenantId}] Conexão ABERTA (WhatsApp pronto).`);
     } else if (connection === "connecting") {
       console.log(`[WP][${tenantId}] Conexão em estado connecting…`);
