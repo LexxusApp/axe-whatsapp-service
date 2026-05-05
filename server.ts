@@ -57,19 +57,15 @@ const BAILEYS_MAX_AUTO_RECONNECT = Math.max(
   Number.parseInt(process.env.BAILEYS_MAX_AUTO_RECONNECT ?? "15", 10) || 15,
 );
 
-/** Nome da tabela em `public` (PostgREST: `public.whatsapp_sessions`). */
+/** Nome lógico da tabela (fisicamente em `public` via `db.schema` no cliente). PostgREST só aceita o nome da tabela em `.from()`, não `public.whatsapp_sessions`. */
 const WHATSAPP_SESSIONS_TABLE = "whatsapp_sessions";
-
-/** Encadeia `.schema("public")` para todas as operações em `whatsapp_sessions`. */
-function whatsappSessionsFrom(client: SupabaseClient) {
-  return client.schema("public").from(WHATSAPP_SESSIONS_TABLE);
-}
 
 const supabaseUrl = process.env.SUPABASE_URL?.trim();
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 let supabaseAdmin: SupabaseClient | null = null;
 if (supabaseUrl && supabaseServiceKey) {
   supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
+    db: { schema: "public" },
     auth: { autoRefreshToken: false, persistSession: false },
     realtime: {
       transport: ws as unknown as WebSocketLikeConstructor,
@@ -99,7 +95,8 @@ async function useSupabaseMultiFileAuthState(tenantId: string, client: SupabaseC
 
   let filesMap: Record<string, unknown> = {};
 
-  const { data: row, error: loadError } = await whatsappSessionsFrom(client)
+  const { data: row, error: loadError } = await client
+    .from("whatsapp_sessions")
     .select("data")
     .eq("id", tenantId)
     .maybeSingle();
@@ -115,7 +112,7 @@ async function useSupabaseMultiFileAuthState(tenantId: string, client: SupabaseC
   const persistLocked = async (): Promise<void> => {
     const data = JSON.parse(JSON.stringify(filesMap, BufferJSON.replacer)) as Record<string, unknown>;
     console.log("Tentando salvar sessão para:", tenantId);
-    const { error } = await whatsappSessionsFrom(client).upsert(
+    const { error } = await client.from("whatsapp_sessions").upsert(
       {
         id: tenantId,
         data,
@@ -266,7 +263,7 @@ function shouldWipeLocalAuthOnDisconnect(statusCode: number | undefined, boomMes
 
 async function wipeAuthStorage(tenantId: string): Promise<void> {
   if (supabaseAdmin) {
-    const { error } = await whatsappSessionsFrom(supabaseAdmin).delete().eq("id", tenantId);
+    const { error } = await supabaseAdmin.from("whatsapp_sessions").delete().eq("id", tenantId);
     if (error) {
       console.warn(
         `[WP][${tenantId}] public.${WHATSAPP_SESSIONS_TABLE} delete: ${error.message} (code=${error.code ?? "n/a"})`,
@@ -292,7 +289,8 @@ async function logSupabaseReachableForTenant(tenantId: string): Promise<void> {
     return;
   }
   try {
-    const { error } = await whatsappSessionsFrom(supabaseAdmin)
+    const { error } = await supabaseAdmin
+      .from("whatsapp_sessions")
       .select("id")
       .eq("id", tenantId)
       .limit(1)
