@@ -57,7 +57,13 @@ const BAILEYS_MAX_AUTO_RECONNECT = Math.max(
   Number.parseInt(process.env.BAILEYS_MAX_AUTO_RECONNECT ?? "15", 10) || 15,
 );
 
+/** Nome da tabela em `public` (PostgREST: `public.whatsapp_sessions`). */
 const WHATSAPP_SESSIONS_TABLE = "whatsapp_sessions";
+
+/** Encadeia `.schema("public")` para todas as operações em `whatsapp_sessions`. */
+function whatsappSessionsFrom(client: SupabaseClient) {
+  return client.schema("public").from(WHATSAPP_SESSIONS_TABLE);
+}
 
 const supabaseUrl = process.env.SUPABASE_URL?.trim();
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
@@ -85,7 +91,7 @@ function reviveSessionFiles(raw: unknown): Record<string, unknown> {
 
 /**
  * Mesma semântica de `useMultiFileAuthState`, mas persiste os arquivos virtuais em
- * `whatsapp_sessions.session_files` via `.select()` / `.upsert()` do @supabase/supabase-js.
+ * `public.whatsapp_sessions` (colunas `id` = tenant, `data` = JSON do estado) via `.select()` / `.upsert()`.
  */
 async function useSupabaseMultiFileAuthState(tenantId: string, client: SupabaseClient) {
   const mutex = new Mutex();
@@ -93,36 +99,33 @@ async function useSupabaseMultiFileAuthState(tenantId: string, client: SupabaseC
 
   let filesMap: Record<string, unknown> = {};
 
-  const { data: row, error: loadError } = await client
-    .from(WHATSAPP_SESSIONS_TABLE)
-    .select("session_files")
-    .eq("tenant_id", tenantId)
+  const { data: row, error: loadError } = await whatsappSessionsFrom(client)
+    .select("data")
+    .eq("id", tenantId)
     .maybeSingle();
 
   if (loadError) {
     console.warn(
-      `[WP][${tenantId}] ${WHATSAPP_SESSIONS_TABLE} select: ${loadError.message} (code=${loadError.code ?? "n/a"})`,
+      `[WP][${tenantId}] public.${WHATSAPP_SESSIONS_TABLE} select: ${loadError.message} (code=${loadError.code ?? "n/a"})`,
     );
-  } else if (row?.session_files && typeof row.session_files === "object") {
-    filesMap = reviveSessionFiles(row.session_files);
+  } else if (row?.data && typeof row.data === "object") {
+    filesMap = reviveSessionFiles(row.data);
   }
 
   const persistLocked = async (): Promise<void> => {
-    const session_files = JSON.parse(JSON.stringify(filesMap, BufferJSON.replacer)) as Record<
-      string,
-      unknown
-    >;
-    const { error } = await client.from(WHATSAPP_SESSIONS_TABLE).upsert(
+    const data = JSON.parse(JSON.stringify(filesMap, BufferJSON.replacer)) as Record<string, unknown>;
+    console.log("Tentando salvar sessão para:", tenantId);
+    const { error } = await whatsappSessionsFrom(client).upsert(
       {
-        tenant_id: tenantId,
-        session_files,
+        id: tenantId,
+        data,
         updated_at: new Date().toISOString(),
       },
-      { onConflict: "tenant_id" },
+      { onConflict: "id" },
     );
     if (error) {
       console.error(
-        `[WP][${tenantId}] ${WHATSAPP_SESSIONS_TABLE} upsert: ${error.message} (code=${error.code ?? "n/a"})`,
+        `[WP][${tenantId}] public.${WHATSAPP_SESSIONS_TABLE} upsert: ${error.message} (code=${error.code ?? "n/a"})`,
       );
     }
   };
@@ -263,13 +266,13 @@ function shouldWipeLocalAuthOnDisconnect(statusCode: number | undefined, boomMes
 
 async function wipeAuthStorage(tenantId: string): Promise<void> {
   if (supabaseAdmin) {
-    const { error } = await supabaseAdmin.from(WHATSAPP_SESSIONS_TABLE).delete().eq("tenant_id", tenantId);
+    const { error } = await whatsappSessionsFrom(supabaseAdmin).delete().eq("id", tenantId);
     if (error) {
       console.warn(
-        `[WP][${tenantId}] ${WHATSAPP_SESSIONS_TABLE} delete: ${error.message} (code=${error.code ?? "n/a"})`,
+        `[WP][${tenantId}] public.${WHATSAPP_SESSIONS_TABLE} delete: ${error.message} (code=${error.code ?? "n/a"})`,
       );
     } else {
-      console.log(`[WP][${tenantId}] Linha removida em ${WHATSAPP_SESSIONS_TABLE} (sessão zerada no Supabase).`);
+      console.log(`[WP][${tenantId}] Linha removida em public.${WHATSAPP_SESSIONS_TABLE} (sessão zerada no Supabase).`);
     }
   }
   const folder = path.join(SESSIONS_ROOT, tenantId);
@@ -280,7 +283,7 @@ async function wipeAuthStorage(tenantId: string): Promise<void> {
 
 async function logSupabaseReachableForTenant(tenantId: string): Promise<void> {
   console.log(
-    `[WP][${tenantId}] Supabase client inicializado=${Boolean(supabaseAdmin)}. Estado Baileys: ${supabaseAdmin ? `tabela ${WHATSAPP_SESSIONS_TABLE}` : `apenas disco (${SESSIONS_ROOT})`}.`,
+    `[WP][${tenantId}] Supabase client inicializado=${Boolean(supabaseAdmin)}. Estado Baileys: ${supabaseAdmin ? `tabela public.${WHATSAPP_SESSIONS_TABLE}` : `apenas disco (${SESSIONS_ROOT})`}.`,
   );
   if (!supabaseAdmin) {
     console.warn(
@@ -289,23 +292,22 @@ async function logSupabaseReachableForTenant(tenantId: string): Promise<void> {
     return;
   }
   try {
-    const { error } = await supabaseAdmin
-      .from(WHATSAPP_SESSIONS_TABLE)
-      .select("tenant_id")
-      .eq("tenant_id", tenantId)
+    const { error } = await whatsappSessionsFrom(supabaseAdmin)
+      .select("id")
+      .eq("id", tenantId)
       .limit(1)
       .maybeSingle();
     if (error) {
       console.warn(
-        `[WP][${tenantId}] Supabase teste ${WHATSAPP_SESSIONS_TABLE}: ${error.message} (code=${error.code ?? "n/a"})`,
+        `[WP][${tenantId}] Supabase teste public.${WHATSAPP_SESSIONS_TABLE}: ${error.message} (code=${error.code ?? "n/a"})`,
       );
     } else {
       console.log(
-        `[WP][${tenantId}] Supabase: select em ${WHATSAPP_SESSIONS_TABLE} respondeu OK (linha opcional; ausência é normal em tenant novo).`,
+        `[WP][${tenantId}] Supabase: select em public.${WHATSAPP_SESSIONS_TABLE} respondeu OK (linha opcional; ausência é normal em tenant novo).`,
       );
     }
   } catch (e: unknown) {
-    console.warn(`[WP][${tenantId}] Supabase teste ${WHATSAPP_SESSIONS_TABLE}: exceção`, e);
+    console.warn(`[WP][${tenantId}] Supabase teste public.${WHATSAPP_SESSIONS_TABLE}: exceção`, e);
   }
 }
 
@@ -483,7 +485,7 @@ async function startBaileysForTenant(tenantId: string, opts?: StartBaileysOption
   console.log(`[WP][${tenantId}] Etapa 3/6: pasta auth local=${authFolder} (fallback / limpeza)`);
   await mkdir(authFolder, { recursive: true });
   console.log(
-    `[WP][${tenantId}] Etapa 4/6: ${supabaseAdmin ? `auth state Supabase (${WHATSAPP_SESSIONS_TABLE})` : "useMultiFileAuthState em disco"}…`,
+    `[WP][${tenantId}] Etapa 4/6: ${supabaseAdmin ? `auth state Supabase (public.${WHATSAPP_SESSIONS_TABLE})` : "useMultiFileAuthState em disco"}…`,
   );
   const { state, saveCreds } = supabaseAdmin
     ? await useSupabaseMultiFileAuthState(tenantId, supabaseAdmin)
@@ -645,7 +647,7 @@ app.post("/whatsapp/start", async (req, res) => {
 
 /**
  * Corpo JSON: { "tenant_id": "<uuid do Supabase>" }
- * Cada zelador usa um tenant_id distinto; com Supabase configurado a sessão Baileys fica em `whatsapp_sessions`;
+ * Cada zelador usa um tenant_id distinto; com Supabase configurado a sessão Baileys fica em `public.whatsapp_sessions` (colunas id, data);
  * sem Supabase, uso apenas disco em ./sessions/<tenant_id>/.
  */
 app.post("/api/whatsapp/session", async (req, res) => {

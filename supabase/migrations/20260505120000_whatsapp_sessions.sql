@@ -2,14 +2,20 @@
 -- Aplicação no Dashboard: SQL Editor > New query > colar e Run.
 
 create table if not exists public.whatsapp_sessions (
-  tenant_id text primary key,
-  session_files jsonb not null default '{}'::jsonb,
+  id text primary key,
+  data jsonb not null default '{}'::jsonb,
   updated_at timestamptz not null default now()
 );
 
 create index if not exists whatsapp_sessions_updated_at_idx on public.whatsapp_sessions (updated_at desc);
 
-comment on table public.whatsapp_sessions is 'Blob JSON dos arquivos virtuais creds/pre-keys etc. do Baileys por tenant.';
+comment on table public.whatsapp_sessions is 'id = tenant_id; data = JSON dos arquivos virtuais Baileys (creds/pre-keys).';
+comment on column public.whatsapp_sessions.id is 'UUID do tenant (Supabase).';
+comment on column public.whatsapp_sessions.data is 'Mapa nome-arquivo -> conteúdo (BufferJSON), espelho do useMultiFileAuthState.';
+
+-- Se você criou a versão antiga com tenant_id/session_files, renomeie antes de usar este app:
+-- alter table public.whatsapp_sessions rename column tenant_id to id;
+-- alter table public.whatsapp_sessions rename column session_files to data;
 
 alter table public.whatsapp_sessions enable row level security;
 
